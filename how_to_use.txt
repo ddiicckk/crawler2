@@ -1,0 +1,9 @@
+# 1) Login (this opens a browser; complete SSO/MFA)
+python lloyds_servicenow_capture.py login \
+  --url "https://myservice.lloyds.com/now/nav/ui/classic/params/target/kb_view.do?sysparm_article=KB0010611" \
+  --state auth_state.json
+
+# 2) Save a full-fidelity archive (recommended)
+python lloyds_servicenow_capture.py save \
+  --url "https://myservice.lloyds.com/now/nav/ui/classic/params/target/kb_view.do?sysparm_article=KB0010611" \
+  --state auth_state.json --format mhtml --out KB0010611.mhtml
