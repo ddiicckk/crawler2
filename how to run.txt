@@ -6,3 +6,24 @@ Subsequent runs:
 python download_kb_to_docx.py --headed
 
 Keep '--headed' for SSO-heavy environments. Once stable, you can try removing it.
+
+------------------------------------------------------------------------------------
+If your Excel has a KB column (recommended)
+python batch_kb_to_docx.py --excel kbs.xlsx --base-host https://myservice.lloyds.com --headed
+
+If your Excel has a URL column
+python batch_kb_to_docx.py --excel kbs.xlsx --headed
+
+Optional controls
+
+Process only first 20 KBs:
+
+python batch_kb_to_docx.py --excel kbs.xlsx --base-host https://myservice.lloyds.com --headed --max 20
+
+Slow it down between KBs (friendlier to the site):
+
+python batch_kb_to_docx.py --excel kbs.xlsx --base-host https://myservice.lloyds.com --headed --sleep 2
+
+If /target/... decoding causes trouble, disable it:
+
+python batch_kb_to_docx.py --excel kbs.xlsx --base-host https://myservice.lloyds.com --headed --skip-direct
