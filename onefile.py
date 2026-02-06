@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-download_kb.py
---------------
-Download a login-protected ServiceNow KB page using Playwright.
+download_kb.py (ServiceNow Classic + SSO robust)
 
-Key fixes for ServiceNow:
-- Avoid wait_until="networkidle" by default (ServiceNow often never becomes network-idle).
-- If navigation times out, still save screenshot + HTML so you get something every run.
-- Optional: also save HTML from the classic UI iframe (default name: gsft_main).
+Why previous output was blank:
+- ServiceNow Classic often loads KB content inside an iframe (commonly 'gsft_main').
+- The outer page can be "loaded" while the iframe is still rendering.
+- storage_state replay can be flaky with enterprise SSO; persistent context is more reliable.
 
-Workflow:
-1) First run (or --relogin): opens a visible browser for manual SSO/MFA login, then saves storage_state.json
-2) Second step: uses saved session to load the KB page and save outputs.
+This script:
+- Uses Playwright persistent context (browser profile on disk) for reliable SSO.
+- Waits for iframe content to become non-empty before saving HTML/screenshot.
+- Saves outer HTML, iframe HTML, screenshot, and a frame list debug file.
 
-Requires:
+Install:
   pip install playwright
   playwright install
+
+Run (first time, login manually):
+  python download_kb.py --headed --relogin
+
+Later runs:
+  python download_kb.py --headed
+  (or try without --headed once it’s stable)
 """
 
 import argparse
+import os
 import re
+import shutil
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
 
 DEFAULT_URL = "https://myservice.lloyds.com/now/nav/ui/classic/params/target/kb_view.do%3Fsysparm_article%3DKB0010611"
 
@@ -35,7 +43,7 @@ def safe_filename(name: str, default: str = "page") -> str:
     return name[:180]
 
 
-def now_stamp() -> str:
+def stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
@@ -44,252 +52,192 @@ def looks_like_login(url: str) -> bool:
     return any(s in u for s in ("login", "sso", "saml", "auth", "okta", "adfs", "signin"))
 
 
-def login_and_save_state(p, url: str, state_file: Path, timeout_ms: int,
-                         login_check_url: str | None = None,
-                         login_check_selector: str | None = None) -> None:
-    print("\n[1/2] Launching a visible browser for manual login...\n")
-
-    browser = p.chromium.launch(headless=False)
-    context = browser.new_context()
-    page = context.new_page()
-    page.set_default_timeout(timeout_ms)
-
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-
-    print("➡️  Complete login in the opened browser window (SSO/MFA as needed).")
-    print("➡️  When you can see the KB content (or you’re fully logged in), return here.\n")
-
-    # Optional auto-checks (non-fatal if they time out)
-    if login_check_url:
-        print(f"🔎 (optional) Waiting for URL to contain: {login_check_url!r}")
-        try:
-            page.wait_for_url(f"**{login_check_url}**", timeout=timeout_ms)
-            print("✅ URL check passed.")
-        except PlaywrightTimeoutError:
-            print("⚠️  URL check timed out (continuing).")
-
-    if login_check_selector:
-        print(f"🔎 (optional) Waiting for selector: {login_check_selector!r}")
-        try:
-            page.wait_for_selector(login_check_selector, timeout=timeout_ms)
-            print("✅ Selector check passed.")
-        except PlaywrightTimeoutError:
-            print("⚠️  Selector check timed out (continuing).")
-
-    input("✅ Press ENTER to save the logged-in session (storage state) and continue... ")
-
-    if looks_like_login(page.url):
-        print(f"⚠️  Current URL still looks like a login page:\n    {page.url}")
-        print("    If you are not actually logged in, re-run with --relogin and try again.\n")
-    else:
-        print(f"✅ Login step URL:\n    {page.url}\n")
-
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(state_file))
-    print(f"✅ Saved session storage state to: {state_file}\n")
-
-    browser.close()
-
-
-def attach_debug_listeners(page):
-    # Useful if something silently fails
+def attach_debug(page):
     page.on("console", lambda msg: print(f"[console] {msg.type}: {msg.text}"))
     page.on("pageerror", lambda err: print(f"[pageerror] {err}"))
     page.on("requestfailed", lambda req: print(f"[requestfailed] {req.url} -> {req.failure}"))
 
 
-def save_artifacts(page, out_dir: Path, base: str, save_screenshot: bool = True) -> tuple[Path | None, Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    png_path = None
-    if save_screenshot:
-        png_path = out_dir / f"{base}.png"
-        try:
-            page.screenshot(path=str(png_path), full_page=True)
-            print(f"✅ Saved screenshot: {png_path}")
-        except Exception as e:
-            print(f"⚠️  Could not save screenshot: {e}")
-            png_path = None
-
-    html_path = out_dir / f"{base}.html"
-    html_path.write_text(page.content(), encoding="utf-8")
-    print(f"✅ Saved rendered HTML: {html_path}")
-
-    return png_path, html_path
-
-
-def save_frame_html(page, out_dir: Path, base: str, frame_name: str) -> Path | None:
+def wait_for_non_empty_text(target, timeout_ms: int, min_chars: int = 200, poll_ms: int = 250) -> int:
     """
-    ServiceNow classic UI often loads content inside an iframe named 'gsft_main'.
-    This will save that frame's HTML if available.
+    Wait until document.body.innerText length exceeds min_chars.
+    Works for Page or Frame (both have .evaluate()).
+    Returns the observed length.
     """
-    frame = page.frame(name=frame_name)
-    if not frame:
-        # Sometimes it might be identified by URL, but we keep it simple here.
-        print(f"ℹ️  Frame '{frame_name}' not found; skipping frame HTML save.")
-        return None
-
-    frame_path = out_dir / f"{base}__frame_{safe_filename(frame_name)}.html"
-    try:
-        frame_path.write_text(frame.content(), encoding="utf-8")
-        print(f"✅ Saved frame HTML ({frame_name}): {frame_path}")
-        return frame_path
-    except Exception as e:
-        print(f"⚠️  Could not save frame HTML ({frame_name}): {e}")
-        return None
-
-
-def fetch_and_save(p, url: str, state_file: Path, out_dir: Path, out_base: str,
-                   selector: str | None, timeout_ms: int, headless: bool,
-                   wait_until: str, frame_name: str | None,
-                   save_frame: bool, wait_after_ms: int) -> None:
-    print("[2/2] Fetching page with stored session...")
-
-    browser = p.chromium.launch(headless=headless)
-    context = browser.new_context(storage_state=str(state_file))
-    page = context.new_page()
-    page.set_default_timeout(timeout_ms)
-    attach_debug_listeners(page)
-
-    # Navigation: Do NOT rely on networkidle for ServiceNow
-    try:
-        page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-        print(f"   - Navigation completed (wait_until={wait_until}).")
-    except PlaywrightTimeoutError:
-        # Important: even if this times out, page may be fully visible/usable
-        print(f"⚠️  Navigation timed out (wait_until={wait_until}).")
-        print("   - ServiceNow often keeps background requests open, so this is common.")
-        print("   - Continuing to save content anyway...")
-
-    print(f"   - Current URL: {page.url}")
-
-    # If we ended up back on login, warn and still save artifacts
-    if looks_like_login(page.url):
-        print("⚠️  It looks like you were redirected to a login/SSO page during fetch.")
-        print("    Your saved session may have expired. Re-run with --relogin.\n")
-
-    # Give the page a moment to render frames/content
-    if wait_after_ms > 0:
+    deadline = time.time() + timeout_ms / 1000
+    last_len = 0
+    while time.time() < deadline:
         try:
-            page.wait_for_timeout(wait_after_ms)
+            last_len = target.evaluate("() => (document.body && document.body.innerText || '').trim().length")
+            if last_len >= min_chars:
+                return last_len
         except Exception:
             pass
+        time.sleep(poll_ms / 1000)
+    return last_len
 
-    # Always save screenshot + HTML
-    stamp = now_stamp()
-    base = f"{out_base}_{stamp}"
-    save_artifacts(page, out_dir, base, save_screenshot=True)
 
-    # Optionally save iframe HTML (gsft_main is common)
-    if save_frame and frame_name:
-        save_frame_html(page, out_dir, base, frame_name=frame_name)
-
-    # Optional text extraction
-    if selector:
-        try:
-            # Try main document first
-            loc = page.locator(selector).first
-            loc.wait_for(state="visible", timeout=timeout_ms)
-            text = loc.inner_text(timeout=timeout_ms)
-            txt_path = out_dir / f"{base}.txt"
-            txt_path.write_text(text, encoding="utf-8")
-            print(f"✅ Saved extracted text (main doc, selector={selector}): {txt_path}")
-        except PlaywrightTimeoutError:
-            print(f"⚠️  Selector not found/visible in main doc within timeout: {selector}")
-
-            # If requested, try inside the frame too
-            if frame_name:
-                frame = page.frame(name=frame_name)
-                if frame:
-                    try:
-                        f_loc = frame.locator(selector).first
-                        f_loc.wait_for(state="visible", timeout=timeout_ms)
-                        f_text = f_loc.inner_text(timeout=timeout_ms)
-                        f_txt_path = out_dir / f"{base}__frame_{safe_filename(frame_name)}.txt"
-                        f_txt_path.write_text(f_text, encoding="utf-8")
-                        print(f"✅ Saved extracted text (frame={frame_name}, selector={selector}): {f_txt_path}")
-                    except PlaywrightTimeoutError:
-                        print(f"⚠️  Selector also not found/visible in frame '{frame_name}': {selector}")
-
-    browser.close()
-    print("\nDone.")
+def save_text_file(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text or "", encoding="utf-8")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Download a login-protected webpage using Playwright storage state.")
-    ap.add_argument("--url", default=DEFAULT_URL, help="Target page URL")
-    ap.add_argument("--state", default="storage_state.json", help="Path to storage state JSON")
-    ap.add_argument("--outdir", default="downloads", help="Output directory for saved files")
-    ap.add_argument("--name", default="", help="Base filename (without extension). If empty, auto-detect from KB number.")
-    ap.add_argument("--selector", default="", help="CSS selector to extract text (optional)")
-    ap.add_argument("--relogin", action="store_true", help="Force re-login and overwrite state")
-    ap.add_argument("--timeout", type=int, default=120_000, help="Timeout in ms (default 120000)")
-    ap.add_argument("--headed", action="store_true", help="Use a visible browser for the fetch step too")
-
-    # Important: default is domcontentloaded (better for ServiceNow than networkidle)
-    ap.add_argument("--wait", choices=["domcontentloaded", "load", "networkidle"],
-                    default="domcontentloaded",
-                    help="Playwright wait_until strategy for fetch step (default domcontentloaded)")
-
-    # Optional login signals
-    ap.add_argument("--login-check-url", default="", help="During login, wait for URL to contain this substring (optional)")
-    ap.add_argument("--login-check-selector", default="", help="During login, wait for selector to appear (optional)")
-
-    # ServiceNow classic UI often uses iframe gsft_main
-    ap.add_argument("--frame-name", default="gsft_main",
-                    help="Frame name to save/extract from (default gsft_main). Use empty to disable.")
-    ap.add_argument("--save-frame-html", action="store_true",
-                    help="Also save the HTML of the specified frame (useful for ServiceNow classic UI).")
-
-    ap.add_argument("--wait-after", type=int, default=3000,
-                    help="Extra wait after navigation (ms) to allow UI/iframes to render (default 3000).")
-
+    ap = argparse.ArgumentParser(description="Download a login-protected ServiceNow KB page using Playwright.")
+    ap.add_argument("--url", default=DEFAULT_URL, help="Target KB URL")
+    ap.add_argument("--outdir", default="downloads", help="Output directory")
+    ap.add_argument("--name", default="", help="Base output name (default: KBxxxx if detected)")
+    ap.add_argument("--timeout", type=int, default=180_000, help="Timeout in ms (default: 180000)")
+    ap.add_argument("--headed", action="store_true", help="Run with visible browser window")
+    ap.add_argument("--relogin", action="store_true", help="Clear profile and login again")
+    ap.add_argument("--profile-dir", default="pw_profile", help="Persistent profile directory (default: pw_profile)")
+    ap.add_argument("--frame-name", default="gsft_main", help="Classic UI iframe name (default: gsft_main)")
+    ap.add_argument("--min-chars", type=int, default=200, help="Minimum text length to consider 'loaded' (default: 200)")
+    ap.add_argument("--save-frame-text", action="store_true", help="Also save iframe body innerText to .txt")
+    ap.add_argument("--debug", action="store_true", help="Extra debug outputs (frame list, keep browser open prompt)")
     args = ap.parse_args()
 
     url = args.url
-    state_file = Path(args.state)
     out_dir = Path(args.outdir)
+    profile_dir = Path(args.profile_dir)
 
-    # Output base name
     if args.name.strip():
-        out_base = safe_filename(args.name.strip())
+        base = safe_filename(args.name.strip())
     else:
         m = re.search(r"(KB\d+)", url)
-        out_base = safe_filename(m.group(1) if m else "page")
+        base = safe_filename(m.group(1) if m else "page")
 
-    selector = args.selector.strip() or None
-    headless_fetch = not args.headed
+    if args.relogin and profile_dir.exists():
+        print(f"🧹 Removing profile dir for relogin: {profile_dir}")
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
-    login_check_url = args.login_check_url.strip() or None
-    login_check_selector = args.login_check_selector.strip() or None
-
-    frame_name = (args.frame_name or "").strip() or None
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        if args.relogin or not state_file.exists():
-            login_and_save_state(
-                p,
-                url=url,
-                state_file=state_file,
-                timeout_ms=args.timeout,
-                login_check_url=login_check_url,
-                login_check_selector=login_check_selector
-            )
-
-        fetch_and_save(
-            p,
-            url=url,
-            state_file=state_file,
-            out_dir=out_dir,
-            out_base=out_base,
-            selector=selector,
-            timeout_ms=args.timeout,
-            headless=headless_fetch,
-            wait_until=args.wait,
-            frame_name=frame_name,
-            save_frame=args.save_frame_html,
-            wait_after_ms=args.wait_after
+        # Persistent context = browser profile on disk (best for enterprise SSO)
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=(not args.headed),
+            viewport={"width": 1400, "height": 900},
         )
+        page = context.new_page()
+        page.set_default_timeout(args.timeout)
+        attach_debug(page)
+
+        print(f"➡️ Navigating: {url}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
+        except PlaywrightTimeoutError:
+            print("⚠️ goto timed out (domcontentloaded). Continuing anyway (common on ServiceNow).")
+
+        # If first time / session expired: user may need to login
+        if looks_like_login(page.url):
+            print(f"🔐 Looks like login/SSO page: {page.url}")
+            print("➡️ Please complete login in the browser window.")
+            if not args.headed:
+                print("❗ You are running headless. Re-run with --headed to login.")
+                context.close()
+                sys.exit(2)
+
+            input("✅ After login completes and you see the KB page, press ENTER here...")
+
+        # After login, ensure we're on target KB (or at least not stuck on auth)
+        print(f"   Current URL: {page.url}")
+        if looks_like_login(page.url):
+            print("❌ Still on login page after waiting. Try --relogin and ensure login completes.")
+            context.close()
+            sys.exit(3)
+
+        # Wait for outer page to have some content (often still small)
+        outer_len = wait_for_non_empty_text(page, timeout_ms=args.timeout, min_chars=max(50, args.min_chars // 4))
+        print(f"   Outer page text length observed: {outer_len}")
+
+        # Dump frame list (debug)
+        frame_list_path = out_dir / f"{base}_{stamp()}__frames.txt"
+        if args.debug:
+            lines = []
+            for fr in page.frames:
+                lines.append(f"name={fr.name!r} url={fr.url}")
+            save_text_file(frame_list_path, "\n".join(lines))
+            print(f"🧾 Saved frame list: {frame_list_path}")
+
+        # Try to get classic UI iframe (gsft_main)
+        frame = page.frame(name=args.frame_name)
+
+        # Sometimes iframe exists but not immediately attached; wait for the iframe element too
+        if frame is None:
+            try:
+                page.wait_for_selector(f"iframe[name='{args.frame_name}']", timeout=30_000)
+                frame = page.frame(name=args.frame_name)
+            except PlaywrightTimeoutError:
+                frame = None
+
+        # Save artifacts AFTER waiting for real content
+        ts = stamp()
+        base_ts = f"{base}_{ts}"
+
+        # Wait for iframe content if present; this is where KB usually is
+        frame_len = None
+        if frame is not None:
+            print(f"🧩 Found frame '{args.frame_name}'. Waiting for KB content to render inside it...")
+            try:
+                # Wait for frame document to be ready-ish
+                frame.wait_for_load_state("domcontentloaded", timeout=60_000)
+            except Exception:
+                pass
+
+            frame_len = wait_for_non_empty_text(frame, timeout_ms=args.timeout, min_chars=args.min_chars)
+            print(f"   Frame text length observed: {frame_len}")
+
+        else:
+            print(f"ℹ️ Frame '{args.frame_name}' not found. Will save outer page only.")
+            print("   (Run with --debug to see frame names/URLs captured.)")
+
+        # Take screenshot (full page)
+        png_path = out_dir / f"{base_ts}.png"
+        try:
+            page.screenshot(path=str(png_path), full_page=True)
+            print(f"✅ Screenshot saved: {png_path}")
+        except Exception as e:
+            print(f"⚠️ Screenshot failed: {e}")
+
+        # Save outer HTML
+        outer_html_path = out_dir / f"{base_ts}.html"
+        outer_html_path.write_text(page.content(), encoding="utf-8")
+        print(f"✅ Outer HTML saved: {outer_html_path}")
+
+        # Save iframe HTML (best chance of actual KB content)
+        if frame is not None:
+            frame_html_path = out_dir / f"{base_ts}__frame_{safe_filename(args.frame_name)}.html"
+            try:
+                frame_html_path.write_text(frame.content(), encoding="utf-8")
+                print(f"✅ Frame HTML saved: {frame_html_path}")
+            except Exception as e:
+                print(f"⚠️ Frame HTML save failed: {e}")
+
+            if args.save_frame_text:
+                frame_txt_path = out_dir / f"{base_ts}__frame_{safe_filename(args.frame_name)}.txt"
+                try:
+                    txt = frame.evaluate("() => (document.body && document.body.innerText || '').trim()")
+                    frame_txt_path.write_text(txt, encoding="utf-8")
+                    print(f"✅ Frame text saved: {frame_txt_path}")
+                except Exception as e:
+                    print(f"⚠️ Frame text save failed: {e}")
+
+        # Final helpful hint if still empty
+        if (frame_len is not None and frame_len < args.min_chars) and outer_len < max(50, args.min_chars // 4):
+            print("\n⚠️ It still looks like content did not render (text lengths are low).")
+            print("Possible causes & fixes:")
+            print("  - The KB content is in a DIFFERENT frame name than 'gsft_main' -> run with --debug")
+            print("  - A post-login redirect needs extra time -> increase --timeout (e.g., 300000)")
+            print("  - The KB page requires additional clicks/consent -> run --headed and observe")
+            print("  - Your org blocks automation in headless -> keep using --headed")
+
+        if args.debug and args.headed:
+            input("\n(debug) Press ENTER to close the browser...")
+
+        context.close()
+        print("\nDone.")
 
 
 if __name__ == "__main__":
