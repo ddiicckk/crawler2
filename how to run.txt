@@ -1,0 +1,8 @@
+Run it:
+First time (SSO):
+python download_kb_to_docx.py --headed --relogin
+
+Subsequent runs:
+python download_kb_to_docx.py --headed
+
+Keep '--headed' for SSO-heavy environments. Once stable, you can try removing it.
