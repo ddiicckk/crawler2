@@ -1,0 +1,4 @@
+pip install playwright python-docx beautifulsoup4 lxml pandas openpyxl
+playwright install
+
+pip install trafilatura
